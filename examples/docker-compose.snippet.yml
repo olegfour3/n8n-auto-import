@@ -1,0 +1,23 @@
+# Minimal n8n service fragment — merge into your docker-compose.yml
+#
+# Prerequisites:
+#   1. Clone this repo (or add as git submodule) and mount it read-only.
+#   2. Export workflows to ./workflows (one JSON file per workflow).
+#   3. Persist n8n data in ./n8n_data.
+
+services:
+  n8n:
+    image: n8nio/n8n:stable
+    entrypoint: ["tini", "--", "/bin/sh", "/n8n-import-scripts/n8n_entrypoint.sh"]
+    command: []
+    environment:
+      - N8N_AUTO_IMPORT_WORKFLOWS=true
+      - N8N_WORKFLOWS_IMPORT_DIR=/workflows
+      - N8N_IMPORT_SCRIPTS_DIR=/n8n-import-scripts
+      # Optional: live Telegram webhook re-register after startup
+      # - N8N_API_KEY=your-api-key-from-n8n-settings
+    volumes:
+      - ./n8n_data:/home/node/.n8n
+      - ./workflows:/workflows:ro
+      - ./path/to/n8n-auto-import:/n8n-import-scripts:ro
+    restart: unless-stopped
