@@ -25,6 +25,7 @@ This entrypoint wrapper runs a deterministic pipeline **before** n8n starts, the
 |---------|--------------|
 | **Fingerprint skip** | SHA-256 of all export JSON — skip import when nothing changed (fast restarts) |
 | **Credential stubs** | Creates empty credentials for missing `(type, name)` pairs; never overwrites secrets |
+| **Credential remap** | After import, retargets node credential ids to existing DB rows by `(type, name)` |
 | **Folder preservation** | Snapshots/restores UI `parentFolderId` around import (folders are not in git) |
 | **Timestamp sanitize** | Fixes invalid `createdAt`/`updatedAt` in SQLite (prevents UI crash) |
 | **Orphan cleanup** | Deactivates active workflows not present in the export |
@@ -44,24 +45,26 @@ On every container start, [`n8n_entrypoint.sh`](n8n_entrypoint.sh) runs:
 4. **`n8n import:workflow --separate`** — load workflows from the mounted export directory.
 5. **Folder restore** — put workflows back into their UI folders.
 6. **Sanitize timestamps** — [`n8n_sanitize_timestamps.js`](n8n_sanitize_timestamps.js).
-7. **Publish pass** (always evaluated):
+7. **Credential remap** — [`n8n_remap_credentials.js`](n8n_remap_credentials.js) (runs every start, even when import was skipped).
+8. **Publish pass** (always evaluated):
    - Deactivate orphan workflows — [`n8n_deactivate_orphans.js`](n8n_deactivate_orphans.js).
    - Skip publish if export unchanged and DB already has `activeVersionId` — [`n8n_publish_needed.js`](n8n_publish_needed.js).
    - Otherwise publish by dependency level — [`n8n_publish_order.js`](n8n_publish_order.js) + [`n8n_publish_batch.js`](n8n_publish_batch.js) (CLI fallback available).
-8. **Clear Telegram webhooks** — [`n8n_clear_telegram_webhooks.js`](n8n_clear_telegram_webhooks.js).
-9. **Start n8n** — delegate to the original Docker entrypoint.
-10. **Re-register Telegram** (background) — [`n8n_reregister_telegram.js`](n8n_reregister_telegram.js) after `/healthz` (requires `N8N_API_KEY`).
+9. **Clear Telegram webhooks** — [`n8n_clear_telegram_webhooks.js`](n8n_clear_telegram_webhooks.js).
+10. **Start n8n** — delegate to the original Docker entrypoint.
+11. **Re-register Telegram** (background) — [`n8n_reregister_telegram.js`](n8n_reregister_telegram.js) after `/healthz` (requires `N8N_API_KEY`).
 
 ```mermaid
 flowchart TD
   start[Container start] --> fp{Export fingerprint changed?}
-  fp -->|no| orphans[Deactivate orphans]
+  fp -->|no| remap[Remap credentials by type+name]
   fp -->|yes| stubs[Credential stubs]
   stubs --> foldersSnap[Snapshot UI folders]
   foldersSnap --> importCLI["n8n import:workflow"]
   importCLI --> foldersRestore[Restore UI folders]
   foldersRestore --> sanitize[Sanitize timestamps]
-  sanitize --> orphans
+  sanitize --> remap
+  remap --> orphans[Deactivate orphans]
   orphans --> publishNeeded{Publish needed?}
   publishNeeded -->|skip| tgClear[Clear Telegram webhooks]
   publishNeeded -->|yes| publishBatch[Publish by dependency order]
@@ -165,9 +168,10 @@ environment:
 
 Secrets are **not** stored in git.
 
-Before import, the stub script scans workflow JSON for credential references and creates missing accounts with empty payloads matched by `(type, name)`. Existing credentials are never overwritten — fill secrets once in the n8n UI.
+1. **Stubs** — before import, [`n8n_ensure_credential_stubs.js`](n8n_ensure_credential_stubs.js) scans workflow JSON for credential references and creates missing accounts with empty payloads matched by `(type, name)`. Prefer the export `id` when creating a stub so `import:workflow` can link nodes. Existing credentials are never overwritten — fill secrets once in the n8n UI.
+2. **Remap** — after import (and on every start), [`n8n_remap_credentials.js`](n8n_remap_credentials.js) rewrites node credential bindings in SQLite to the preferred local row for the same `(type, name)` (filled secret wins over empty stub; else oldest `createdAt`).
 
-n8n remaps credential ids on import using `(name, type)`.
+`n8n import:workflow` keeps credential ids from the export as-is. If those ids do not exist locally (or differ from a filled credential with the same name), nodes show missing credentials until remap runs — that is why step 2 is required and is not optional “submodule prep”.
 
 ---
 
