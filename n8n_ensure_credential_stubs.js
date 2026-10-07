@@ -63,7 +63,8 @@ function genId() {
 }
 
 function collectNeededCredentials(workflowsDir) {
-	const needed = new Map(); // key: type\0name -> {type, name}
+	// key: type\0name -> {type, name, ids:Set}
+	const needed = new Map();
 	if (!fs.existsSync(workflowsDir)) {
 		return needed;
 	}
@@ -82,7 +83,13 @@ function collectNeededCredentials(workflowsDir) {
 				if (!meta || typeof meta !== 'object') continue;
 				const name = meta.name;
 				if (!name) continue;
-				needed.set(`${ctype}\0${name}`, { type: ctype, name });
+				const key = `${ctype}\0${name}`;
+				let entry = needed.get(key);
+				if (!entry) {
+					entry = { type: ctype, name, ids: new Set() };
+					needed.set(key, entry);
+				}
+				if (meta.id) entry.ids.add(String(meta.id));
 			}
 		}
 	}
@@ -102,24 +109,26 @@ function listExistingCredentials() {
 		// Fresh install may have zero credentials — still ok if dir empty
 		if (!fs.existsSync(tmp) || fs.readdirSync(tmp).length === 0) {
 			if (/Successfully exported 0|no credentials/i.test(stderr + (e.stdout || ''))) {
-				return new Set();
+				return { byName: new Set(), byId: new Set() };
 			}
 			warn(`export:credentials failed: ${stderr.slice(0, 300)}`);
-			return new Set();
+			return { byName: new Set(), byId: new Set() };
 		}
 	}
-	const existing = new Set();
+	const byName = new Set();
+	const byId = new Set();
 	for (const file of fs.readdirSync(tmp)) {
 		if (!file.endsWith('.json')) continue;
 		try {
 			const c = JSON.parse(fs.readFileSync(path.join(tmp, file), 'utf8'));
-			if (c.type && c.name) existing.add(`${c.type}\0${c.name}`);
+			if (c.type && c.name) byName.add(`${c.type}\0${c.name}`);
+			if (c.id) byId.add(String(c.id));
 		} catch {
 			/* skip */
 		}
 	}
 	fs.rmSync(tmp, { recursive: true, force: true });
-	return existing;
+	return { byName, byId };
 }
 
 function encryptData(plainObj, encryptionKey) {
@@ -147,14 +156,25 @@ function main() {
 	}
 
 	const existing = listExistingCredentials();
-	log(`needed=${needed.size} existing=${existing.size}`);
+	log(`needed=${needed.size} existingByName=${existing.byName.size} existingById=${existing.byId.size}`);
 
+	// Only create a stub when neither (type,name) nor any export id exists.
+	// Prefer export id so import:workflow can link nodes; remap script may still
+	// retarget to a real (filled) credential with the same name later.
 	const missing = [];
-	for (const [key, ref] of needed) {
-		if (!existing.has(key)) missing.push(ref);
+	for (const [, ref] of needed) {
+		const key = `${ref.type}\0${ref.name}`;
+		if (existing.byName.has(key)) continue;
+		const exportIds = [...ref.ids];
+		if (exportIds.some((id) => existing.byId.has(id))) continue;
+		missing.push({
+			type: ref.type,
+			name: ref.name,
+			id: exportIds[0] || genId(),
+		});
 	}
 	if (missing.length === 0) {
-		log('all credential stubs already present');
+		log('all credential stubs already present (by name or id)');
 		return 0;
 	}
 
@@ -172,12 +192,11 @@ function main() {
 	fs.mkdirSync(STUBS_DIR, { recursive: true });
 
 	const files = [];
-	for (const { type, name } of missing) {
+	for (const { type, name, id } of missing) {
 		const plain = EMPTY_DATA_BY_TYPE[type] || {};
 		if (!EMPTY_DATA_BY_TYPE[type]) {
 			warn(`no empty template for type=${type}; using {}`);
 		}
-		const id = genId();
 		const stub = {
 			id,
 			name,

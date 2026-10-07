@@ -269,6 +269,13 @@ do_import() {
       warn "could not write fingerprint to $FINGERPRINT_FILE"
     fi
   fi
+
+  # Always remap: export ids often drift from local credential ids for the same name.
+  if [ -f "$SCRIPTS_DIR/n8n_remap_credentials.js" ]; then
+    log "remap node credentials by (type, name)"
+    run_node "$SCRIPTS_DIR/n8n_remap_credentials.js" || warn "credential remap failed"
+  fi
+
   log_phase import "$import_start"
 
   publish_start="$(now_sec)"
