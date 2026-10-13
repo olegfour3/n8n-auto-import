@@ -14,8 +14,8 @@ services:
       - N8N_AUTO_IMPORT_WORKFLOWS=true
       - N8N_WORKFLOWS_IMPORT_DIR=/workflows
       - N8N_IMPORT_SCRIPTS_DIR=/n8n-import-scripts
-      # Optional: live Telegram webhook re-register after startup
-      # - N8N_API_KEY=your-api-key-from-n8n-settings
+      # Required for Telegram webhook clear + live re-register (Settings → API)
+      - N8N_API_KEY=${N8N_API_KEY:-}
     volumes:
       - ./n8n_data:/home/node/.n8n
       - ./workflows:/workflows:ro

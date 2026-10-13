@@ -4,7 +4,8 @@
  * so setWebhook runs in the LIVE process (same as manual UI publish).
  *
  * Requires N8N_API_KEY (Settings → API in n8n UI).
- * If unset — skip (pre-start clear + activate on boot still runs).
+ * If unset — skip (pre-start clear also skips without the key).
+ * Activate HTTP ≥400 → process.exit(1) so the failure is visible in logs.
  *
  * Env:
  *   N8N_API_KEY
@@ -76,11 +77,20 @@ function request(method, urlPath, body) {
 	});
 }
 
-async function waitHealthy() {
+function briefBody(body) {
+	return String(body || '')
+		.replace(/<[^>]+>/g, ' ')
+		.replace(/\s+/g, ' ')
+		.trim()
+		.slice(0, 200);
+}
+
+/** /healthz can be up before Public API routes exist — wait for GET /api/v1/workflows. */
+async function waitApiReady() {
 	const deadline = Date.now() + WAIT_SEC * 1000;
 	while (Date.now() < deadline) {
 		try {
-			const res = await request('GET', '/healthz');
+			const res = await request('GET', '/api/v1/workflows?limit=1');
 			if (res.status >= 200 && res.status < 300) return true;
 		} catch {
 			/* retry */
@@ -88,6 +98,19 @@ async function waitHealthy() {
 		await new Promise((r) => setTimeout(r, 2000));
 	}
 	return false;
+}
+
+async function postWithRetry(urlPath, label) {
+	const attempts = 4;
+	let last = { status: 0, body: '' };
+	for (let i = 1; i <= attempts; i += 1) {
+		last = await request('POST', urlPath);
+		if (last.status < 400) return last;
+		if (last.status !== 404 || i === attempts) return last;
+		warn(`${label}: HTTP 404 (API not ready?), retry ${i}/${attempts}`);
+		await new Promise((r) => setTimeout(r, 2000 * i));
+	}
+	return last;
 }
 
 function telegramWorkflowIds() {
@@ -112,36 +135,48 @@ async function main() {
 		log('disabled');
 		return;
 	}
-	if (!API_KEY) {
-		log('N8N_API_KEY not set; skip live re-register (pre-start clear still applies)');
-		return;
-	}
-
-	log(`waiting for ${BASE}/healthz (up to ${WAIT_SEC}s)`);
-	if (!(await waitHealthy())) {
-		warn('n8n not healthy in time; skip');
-		return;
-	}
 
 	const ids = telegramWorkflowIds();
+	if (!API_KEY) {
+		if (ids.length) {
+			warn(
+				`N8N_API_KEY not set; skip live re-register for ${ids.length} telegramTrigger workflow(s) (pre-start clear also skipped without key)`,
+			);
+		} else {
+			log('N8N_API_KEY not set; skip live re-register');
+		}
+		return;
+	}
+
+	log(`waiting for ${BASE}/api/v1/workflows (up to ${WAIT_SEC}s)`);
+	if (!(await waitApiReady())) {
+		warn('n8n Public API not ready in time; skip');
+		return;
+	}
+
 	if (!ids.length) {
 		log('no active telegramTrigger workflows');
 		return;
 	}
 
+	let activateFailed = false;
 	for (const id of ids) {
 		log(`re-register ${id}`);
-		const off = await request('POST', `/api/v1/workflows/${id}/deactivate`);
+		const off = await postWithRetry(`/api/v1/workflows/${id}/deactivate`, `deactivate ${id}`);
 		if (off.status >= 400) {
-			warn(`deactivate ${id}: HTTP ${off.status} ${off.body.slice(0, 120)}`);
+			warn(`deactivate ${id}: HTTP ${off.status} ${briefBody(off.body)}`);
 		}
 		await new Promise((r) => setTimeout(r, 1000));
-		const on = await request('POST', `/api/v1/workflows/${id}/activate`);
+		const on = await postWithRetry(`/api/v1/workflows/${id}/activate`, `activate ${id}`);
 		if (on.status >= 400) {
-			warn(`activate ${id}: HTTP ${on.status} ${on.body.slice(0, 120)}`);
+			warn(`activate ${id}: HTTP ${on.status} ${briefBody(on.body)}`);
+			activateFailed = true;
 		} else {
 			log(`activated ${id}`);
 		}
+	}
+	if (activateFailed) {
+		process.exit(1);
 	}
 }
 

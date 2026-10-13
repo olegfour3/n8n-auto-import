@@ -12,6 +12,8 @@
  *   N8N_CONFIG_FILE         (default /home/node/.n8n/config)
  *   N8N_WORKFLOWS_IMPORT_DIR (default /workflows) — only clear bots from active=true exports
  *   N8N_CLEAR_TELEGRAM_WEBHOOKS=false — kill-switch
+ *   N8N_API_KEY — required; without it clear is skipped (delete without live
+ *     re-register leaves the bot with an empty webhook)
  */
 'use strict';
 
@@ -24,6 +26,7 @@ const Module = require('module');
 const DB_PATH = process.env.N8N_DATABASE_SQLITE || '/home/node/.n8n/database.sqlite';
 const CONFIG_PATH = process.env.N8N_CONFIG_FILE || '/home/node/.n8n/config';
 const WORKFLOWS_DIR = process.env.N8N_WORKFLOWS_IMPORT_DIR || '/workflows';
+const API_KEY = process.env.N8N_API_KEY || '';
 const ENABLED = process.env.N8N_CLEAR_TELEGRAM_WEBHOOKS !== 'false'
 	&& process.env.N8N_CLEAR_TELEGRAM_WEBHOOKS !== '0';
 
@@ -119,6 +122,10 @@ function deleteWebhook(token) {
 async function main() {
 	if (!ENABLED) {
 		log('disabled (N8N_CLEAR_TELEGRAM_WEBHOOKS=false)');
+		return;
+	}
+	if (!API_KEY) {
+		log('skip clear: N8N_API_KEY unset (would leave bot without webhook)');
 		return;
 	}
 	if (!fs.existsSync(DB_PATH) || !fs.existsSync(CONFIG_PATH)) {

@@ -292,6 +292,8 @@ do_import() {
 pre_start="$(now_sec)"
 do_import || warn "auto-import aborted with error"
 
+# Telegram clear requires N8N_API_KEY; without it the JS script is a no-op
+# (deleteWebhook without live re-register would leave the bot silent).
 tg_start="$(now_sec)"
 if [ -f "$SCRIPTS_DIR/n8n_clear_telegram_webhooks.js" ]; then
   log "clear Telegram webhooks before start"

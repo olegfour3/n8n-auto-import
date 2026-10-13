@@ -136,8 +136,8 @@ docker compose logs n8n 2>&1 | grep 'n8n-auto-import'
 | `N8N_PUBLISH_USE_BATCH` | `true` | Use single-process batch publish |
 | `N8N_PUBLISH_USE_CLI_FALLBACK` | `true` | Fall back to `n8n publish:workflow` per id |
 | `N8N_PUBLISH_PARALLEL` | `4` | Parallelism for CLI fallback within a level |
-| `N8N_CLEAR_TELEGRAM_WEBHOOKS` | `true` | Pre-start `deleteWebhook` for active triggers |
-| `N8N_API_KEY` | — | Public API key for live Telegram re-register |
+| `N8N_CLEAR_TELEGRAM_WEBHOOKS` | `true` | Pre-start `deleteWebhook` for active triggers (no-op without `N8N_API_KEY`) |
+| `N8N_API_KEY` | — | **Required** for Telegram clear + live re-register (Settings → API) |
 | `N8N_REREGISTER_TELEGRAM` | `true` | Post-start deactivate+activate via API |
 | `N8N_REREGISTER_WAIT_SEC` | `90` | Max wait for `/healthz` |
 | `N8N_DATABASE_SQLITE` | `~/.n8n/database.sqlite` | SQLite path for direct DB scripts |
@@ -188,7 +188,9 @@ Two-step fix for “trigger shows active but messages never arrive” after nigh
 1. **Pre-start** — `deleteWebhook` for bots used by active `telegramTrigger` workflows.
 2. **Post-start** — deactivate + activate those workflows via Public API so `setWebhook` runs in the live process (same as manual UI publish).
 
-`n8n publish:workflow` only writes to the database; it does not call Telegram. Set `N8N_API_KEY` (Settings → API in n8n) for step 2.
+`n8n publish:workflow` only writes to the database; it does not call Telegram. Set `N8N_API_KEY` (Settings → API in n8n) and pass it into the container: prod → root `.env`, local/dev → `.env.dev` (separate keys per n8n instance).
+
+**Without `N8N_API_KEY`:** both steps are skipped — clear is a no-op so a missing key cannot wipe the webhook and leave the bot silent. Activate HTTP errors after re-register exit with code 1 so failures show up in `docker compose logs n8n`.
 
 ---
 
