@@ -319,7 +319,17 @@ n8n_pid=$!
 
 if [ -f "$SCRIPTS_DIR/n8n_reregister_telegram.js" ]; then
   (
-    run_node "$SCRIPTS_DIR/n8n_reregister_telegram.js" || warn "telegram live re-register failed"
+    # One shot often races n8n boot: clear already deleted the webhook.
+    attempt=1
+    while [ "$attempt" -le 3 ]; do
+      if run_node "$SCRIPTS_DIR/n8n_reregister_telegram.js"; then
+        exit 0
+      fi
+      warn "telegram live re-register failed (attempt ${attempt}/3), retry in 15s"
+      attempt=$((attempt + 1))
+      sleep 15
+    done
+    warn "telegram live re-register gave up; webhook may be empty"
   ) &
 fi
 

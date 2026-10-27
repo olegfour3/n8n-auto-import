@@ -5,7 +5,8 @@
  *
  * Requires N8N_API_KEY (Settings → API in n8n UI).
  * If unset — skip (pre-start clear also skips without the key).
- * Activate HTTP ≥400 → process.exit(1) so the failure is visible in logs.
+ * Success is getWebhookInfo.url, not HTTP 200 from n8n.
+ * Activate HTTP ≥400 or an empty webhook → process.exit(1).
  *
  * Env:
  *   N8N_API_KEY
@@ -85,32 +86,130 @@ function briefBody(body) {
 		.slice(0, 200);
 }
 
-/** /healthz can be up before Public API routes exist — wait for GET /api/v1/workflows. */
-async function waitApiReady() {
-	const deadline = Date.now() + WAIT_SEC * 1000;
+function sleep(ms) {
+	return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Editor SPA returns 200 HTML for unknown GET paths before Public API routes exist.
+ * Only a JSON workflow list means POST /activate can work.
+ */
+function isWorkflowList(res) {
+	if (!res || res.status < 200 || res.status >= 300) return false;
+	const body = String(res.body || '').trim();
+	if (!body.startsWith('{') && !body.startsWith('[')) return false;
+	try {
+		const parsed = JSON.parse(body);
+		if (Array.isArray(parsed)) return true;
+		return Array.isArray(parsed?.data);
+	} catch {
+		return false;
+	}
+}
+
+/** Express default 404 while the route is not mounted yet. A real n8n 404 is JSON. */
+function isRouteMissing(res) {
+	if (!res || res.status !== 404) return false;
+	const body = String(res.body || '');
+	return /Cannot POST/i.test(body) || body.trim().startsWith('<');
+}
+
+/** /healthz and the editor HTML can be up before Public API routes exist. */
+async function waitApiReady(deadline) {
 	while (Date.now() < deadline) {
 		try {
 			const res = await request('GET', '/api/v1/workflows?limit=1');
-			if (res.status >= 200 && res.status < 300) return true;
+			if (isWorkflowList(res)) return true;
 		} catch {
 			/* retry */
 		}
-		await new Promise((r) => setTimeout(r, 2000));
+		await sleep(2000);
 	}
 	return false;
 }
 
-async function postWithRetry(urlPath, label) {
-	const attempts = 4;
+async function postUntilReady(urlPath, label, deadline) {
+	let attempt = 0;
 	let last = { status: 0, body: '' };
-	for (let i = 1; i <= attempts; i += 1) {
-		last = await request('POST', urlPath);
+	while (Date.now() < deadline) {
+		attempt += 1;
+		try {
+			last = await request('POST', urlPath);
+		} catch (err) {
+			warn(`${label}: ${err.message}, retry ${attempt}`);
+			await sleep(3000);
+			continue;
+		}
 		if (last.status < 400) return last;
-		if (last.status !== 404 || i === attempts) return last;
-		warn(`${label}: HTTP 404 (API not ready?), retry ${i}/${attempts}`);
-		await new Promise((r) => setTimeout(r, 2000 * i));
+		const retryable = isRouteMissing(last) || last.status >= 500;
+		if (!retryable) return last;
+		warn(`${label}: HTTP ${last.status} (API not ready?), retry ${attempt}`);
+		await sleep(3000);
 	}
 	return last;
+}
+
+function getWebhookInfo(token) {
+	return new Promise((resolve) => {
+		const req = https.get(
+			`https://api.telegram.org/bot${token}/getWebhookInfo`,
+			{ timeout: 15000 },
+			(res) => {
+				let body = '';
+				res.on('data', (chunk) => {
+					body += chunk;
+				});
+				res.on('end', () => {
+					try {
+						const parsed = JSON.parse(body);
+						const url = parsed?.result?.url || '';
+						resolve({
+							ok: !!parsed.ok && !!url,
+							url,
+							description: parsed.description || '',
+						});
+					} catch {
+						resolve({ ok: false, url: '', description: `bad response HTTP ${res.statusCode}` });
+					}
+				});
+			},
+		);
+		req.on('error', (err) => resolve({ ok: false, url: '', description: err.message }));
+		req.on('timeout', () => {
+			req.destroy();
+			resolve({ ok: false, url: '', description: 'timeout' });
+		});
+	});
+}
+
+/** Ground truth: Telegram has a non-empty webhook URL for every bot token in active triggers. */
+async function webhooksBound() {
+	const { loadTelegramTokens } = require('./n8n_clear_telegram_webhooks');
+	const tokens = await loadTelegramTokens();
+	if (!tokens.length) {
+		warn('webhook verify: no bot tokens');
+		return false;
+	}
+	for (let i = 0; i < 5; i += 1) {
+		const urls = [];
+		let pending = false;
+		for (const token of tokens) {
+			const info = await getWebhookInfo(token);
+			if (!info.url) {
+				pending = true;
+				if (info.description) warn(`getWebhookInfo: ${info.description}`);
+				break;
+			}
+			urls.push(info.url);
+		}
+		if (!pending) {
+			for (const url of urls) log(`webhook set: ${url}`);
+			return true;
+		}
+		await sleep(2000);
+	}
+	warn('webhook url still empty after activate');
+	return false;
 }
 
 function telegramWorkflowIds() {
@@ -148,10 +247,11 @@ async function main() {
 		return;
 	}
 
-	log(`waiting for ${BASE}/api/v1/workflows (up to ${WAIT_SEC}s)`);
-	if (!(await waitApiReady())) {
-		warn('n8n Public API not ready in time; skip');
-		return;
+	const deadline = Date.now() + WAIT_SEC * 1000;
+	log(`waiting for ${BASE}/api/v1/workflows JSON (up to ${WAIT_SEC}s)`);
+	if (!(await waitApiReady(deadline))) {
+		warn('n8n Public API not ready in time');
+		process.exit(1);
 	}
 
 	if (!ids.length) {
@@ -162,12 +262,24 @@ async function main() {
 	let activateFailed = false;
 	for (const id of ids) {
 		log(`re-register ${id}`);
-		const off = await postWithRetry(`/api/v1/workflows/${id}/deactivate`, `deactivate ${id}`);
+		const off = await postUntilReady(
+			`/api/v1/workflows/${id}/deactivate`,
+			`deactivate ${id}`,
+			deadline,
+		);
 		if (off.status >= 400) {
 			warn(`deactivate ${id}: HTTP ${off.status} ${briefBody(off.body)}`);
+			if (isRouteMissing(off) || off.status >= 500 || off.status === 0) {
+				activateFailed = true;
+				break;
+			}
 		}
-		await new Promise((r) => setTimeout(r, 1000));
-		const on = await postWithRetry(`/api/v1/workflows/${id}/activate`, `activate ${id}`);
+		await sleep(1000);
+		const on = await postUntilReady(
+			`/api/v1/workflows/${id}/activate`,
+			`activate ${id}`,
+			deadline,
+		);
 		if (on.status >= 400) {
 			warn(`activate ${id}: HTTP ${on.status} ${briefBody(on.body)}`);
 			activateFailed = true;
@@ -175,12 +287,34 @@ async function main() {
 			log(`activated ${id}`);
 		}
 	}
-	if (activateFailed) {
+	if (activateFailed || !(await webhooksBound())) {
 		process.exit(1);
 	}
 }
 
-main().catch((err) => {
-	console.error(`[n8n-reregister-tg] ERROR: ${err.message}`);
-	process.exit(1);
-});
+function selfCheck() {
+	const assert = require('assert');
+	assert.strictEqual(isWorkflowList({ status: 200, body: '{"data":[]}' }), true);
+	assert.strictEqual(isWorkflowList({ status: 200, body: '<!DOCTYPE html><html>' }), false);
+	assert.strictEqual(isWorkflowList({ status: 401, body: '{"message":"unauthorized"}' }), false);
+	assert.strictEqual(
+		isRouteMissing({ status: 404, body: 'Cannot POST /api/v1/workflows/x/activate' }),
+		true,
+	);
+	assert.strictEqual(isRouteMissing({ status: 404, body: '{"message":"not found"}' }), false);
+}
+
+if (process.env.N8N_REREGISTER_SELF_CHECK === '1') {
+	selfCheck();
+	console.log('ok');
+	process.exit(0);
+}
+
+if (require.main === module) {
+	main().catch((err) => {
+		console.error(`[n8n-reregister-tg] ERROR: ${err.message}`);
+		process.exit(1);
+	});
+}
+
+module.exports = { isWorkflowList, isRouteMissing };

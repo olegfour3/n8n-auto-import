@@ -119,30 +119,19 @@ function deleteWebhook(token) {
 	});
 }
 
-async function main() {
-	if (!ENABLED) {
-		log('disabled (N8N_CLEAR_TELEGRAM_WEBHOOKS=false)');
-		return;
-	}
-	if (!API_KEY) {
-		log('skip clear: N8N_API_KEY unset (would leave bot without webhook)');
-		return;
-	}
-	if (!fs.existsSync(DB_PATH) || !fs.existsSync(CONFIG_PATH)) {
-		log('no db/config yet; skip');
-		return;
-	}
+async function loadTelegramTokens() {
+	if (!fs.existsSync(DB_PATH) || !fs.existsSync(CONFIG_PATH)) return [];
 
 	const refs = telegramCredentialRefsFromExport();
 	if (!refs.ids.size && !refs.names.size) {
 		log('no telegramTrigger credentials in active exports; skip');
-		return;
+		return [];
 	}
 
 	const encryptionKey = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')).encryptionKey;
 	if (!encryptionKey) {
 		warn('no encryptionKey in config; skip');
-		return;
+		return [];
 	}
 
 	const sqlite3 = loadSqlite3();
@@ -167,7 +156,7 @@ async function main() {
 			warn(
 				`no matching telegramApi credentials (ids=${[...refs.ids].join(',') || '-'} names=${[...refs.names].join(',') || '-'})`,
 			);
-			return;
+			return [];
 		}
 
 		const tokens = new Set();
@@ -186,25 +175,40 @@ async function main() {
 			}
 		}
 
-		if (!tokens.size) {
-			warn('no bot tokens decrypted; skip');
-			return;
-		}
-
-		for (const token of tokens) {
-			const result = await deleteWebhook(token);
-			if (result.ok) {
-				log('deleteWebhook ok');
-			} else {
-				warn(`deleteWebhook failed: ${result.description}`);
-			}
-		}
+		return [...tokens];
 	} finally {
 		db.close();
 	}
 }
 
-main().catch((err) => {
-	console.error(`[n8n-clear-tg-webhooks] ERROR: ${err.message}`);
-	process.exit(1);
-});
+async function main() {
+	if (!ENABLED) {
+		log('disabled (N8N_CLEAR_TELEGRAM_WEBHOOKS=false)');
+		return;
+	}
+	if (!API_KEY) {
+		log('skip clear: N8N_API_KEY unset (would leave bot without webhook)');
+		return;
+	}
+
+	const tokens = await loadTelegramTokens();
+	if (!tokens.length) return;
+
+	for (const token of tokens) {
+		const result = await deleteWebhook(token);
+		if (result.ok) {
+			log('deleteWebhook ok');
+		} else {
+			warn(`deleteWebhook failed: ${result.description}`);
+		}
+	}
+}
+
+if (require.main === module) {
+	main().catch((err) => {
+		console.error(`[n8n-clear-tg-webhooks] ERROR: ${err.message}`);
+		process.exit(1);
+	});
+}
+
+module.exports = { loadTelegramTokens };
